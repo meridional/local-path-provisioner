@@ -28,7 +28,9 @@ const (
 )
 
 const (
-	KeyNode = "kubernetes.io/hostname"
+	KeyNode            = "kubernetes.io/hostname"
+	KeyZone            = "topology.kubernetes.io/zone"
+	KeyZoneDeperacated = "failure-domain.beta.kubernetes.io/zone"
 
 	NodeDefaultNonListedNodes = "DEFAULT_PATH_FOR_NON_LISTED_NODES"
 
@@ -72,8 +74,8 @@ type NodePathMapData struct {
 }
 
 type ConfigData struct {
-	NodePathMap []*NodePathMapData `json:"nodePathMap,omitempty"`
-	CmdTimeoutSeconds int `json:"cmdTimeoutSeconds,omitempty"`
+	NodePathMap          []*NodePathMapData `json:"nodePathMap,omitempty"`
+	CmdTimeoutSeconds    int                `json:"cmdTimeoutSeconds,omitempty"`
 	SharedFileSystemPath string             `json:"sharedFileSystemPath,omitempty"`
 }
 
@@ -82,13 +84,14 @@ type NodePathMap struct {
 }
 
 type Config struct {
-	NodePathMap       map[string]*NodePathMap
-	CmdTimeoutSeconds int
+	NodePathMap          map[string]*NodePathMap
+	CmdTimeoutSeconds    int
 	SharedFileSystemPath string
 }
 
 func NewProvisioner(stopCh chan struct{}, kubeClient *clientset.Clientset,
-	configFile, namespace, helperImage, configMapName, serviceAccountName, helperPodYaml string) (*LocalPathProvisioner, error) {
+	configFile, namespace, helperImage, configMapName, serviceAccountName, helperPodYaml string,
+) (*LocalPathProvisioner, error) {
 	p := &LocalPathProvisioner{
 		stopCh: stopCh,
 
@@ -185,7 +188,11 @@ func (p *LocalPathProvisioner) getRandomPathOnNode(node string) (string, error) 
 	if npMap == nil {
 		npMap = c.NodePathMap[NodeDefaultNonListedNodes]
 		if npMap == nil {
-			return "", fmt.Errorf("config doesn't contain node %v, and no %v available", node, NodeDefaultNonListedNodes)
+			return "", fmt.Errorf(
+				"config doesn't contain node %v, and no %v available",
+				node,
+				NodeDefaultNonListedNodes,
+			)
 		}
 		logrus.Debugf("config doesn't contain node %v, use %v instead", node, NodeDefaultNonListedNodes)
 	}
@@ -210,7 +217,9 @@ func (p *LocalPathProvisioner) isSharedFilesystem() (bool, error) {
 
 	c := p.config
 	if (c.SharedFileSystemPath != "") && (len(c.NodePathMap) != 0) {
-		return false, fmt.Errorf("both nodePathMap and sharedFileSystemPath are defined. Please make sure only one is in use")
+		return false, fmt.Errorf(
+			"both nodePathMap and sharedFileSystemPath are defined. Please make sure only one is in use",
+		)
 	}
 
 	if len(c.NodePathMap) != 0 {
@@ -296,11 +305,17 @@ func (p *LocalPathProvisioner) Provision(opts pvController.ProvisionOptions) (*v
 		}
 	}
 
-	var nodeAffinity *v1.VolumeNodeAffinity
+	var (
+		nodeAffinity *v1.VolumeNodeAffinity
+		labels       map[string]string
+	)
 	if sharedFS {
 		// If the same filesystem is mounted across all nodes, we don't need
 		// affinity, as path is accessible from any node
 		nodeAffinity = nil
+		labels = map[string]string{
+			KeyZone: getZone(node.Labels),
+		}
 	} else {
 		valueNode, ok := node.GetLabels()[KeyNode]
 		if !ok {
@@ -326,7 +341,8 @@ func (p *LocalPathProvisioner) Provision(opts pvController.ProvisionOptions) (*v
 	}
 	return &v1.PersistentVolume{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
+			Name:   name,
+			Labels: labels,
 		},
 		Spec: v1.PersistentVolumeSpec{
 			PersistentVolumeReclaimPolicy: *opts.StorageClass.ReclaimPolicy,
@@ -336,7 +352,7 @@ func (p *LocalPathProvisioner) Provision(opts pvController.ProvisionOptions) (*v
 				v1.ResourceName(v1.ResourceStorage): pvc.Spec.Resources.Requests[v1.ResourceName(v1.ResourceStorage)],
 			},
 			PersistentVolumeSource: pvs,
-			NodeAffinity: nodeAffinity,
+			NodeAffinity:           nodeAffinity,
 		},
 	}, nil
 }
@@ -500,7 +516,11 @@ func (p *LocalPathProvisioner) createHelperPod(action ActionType, cmd []string, 
 	volumeDir = strings.TrimSuffix(volumeDir, string(filepath.Separator))
 	if parentDir == "" || volumeDir == "" || !filepath.IsAbs(parentDir) {
 		// it covers the `/` case
-		return fmt.Errorf("invalid path %v for %v: cannot find parent dir or volume dir or parent dir is relative", action, o.Path)
+		return fmt.Errorf(
+			"invalid path %v for %v: cannot find parent dir or volume dir or parent dir is relative",
+			action,
+			o.Path,
+		)
 	}
 	env := []v1.EnvVar{
 		{Name: envVolDir, Value: filepath.Join(parentDir, volumeDir)},
@@ -524,9 +544,11 @@ func (p *LocalPathProvisioner) createHelperPod(action ActionType, cmd []string, 
 	helperPod.Spec.Volumes = append(helperPod.Spec.Volumes, lpvVolumes...)
 	helperPod.Spec.Containers[0].Command = cmd
 	helperPod.Spec.Containers[0].Env = append(helperPod.Spec.Containers[0].Env, env...)
-	helperPod.Spec.Containers[0].Args = []string{"-p", filepath.Join(parentDir, volumeDir),
+	helperPod.Spec.Containers[0].Args = []string{
+		"-p", filepath.Join(parentDir, volumeDir),
 		"-s", strconv.FormatInt(o.SizeInBytes, 10),
-		"-m", string(o.Mode)}
+		"-m", string(o.Mode),
+	}
 
 	// If it already exists due to some previous errors, the pod will be cleaned up later automatically
 	// https://github.com/rancher/local-path-provisioner/issues/27
@@ -648,4 +670,13 @@ func canonicalizeConfig(data *ConfigData) (cfg *Config, err error) {
 		cfg.CmdTimeoutSeconds = defaultCmdTimeoutSeconds
 	}
 	return cfg, nil
+}
+
+func getZone(nodeLabels map[string]string) string {
+	// Sometimes in k3d, KeyZone is populated later than
+	// KeyZoneDeperacated
+	if zone, ok := nodeLabels[KeyZone]; ok {
+		return zone
+	}
+	return nodeLabels[KeyZoneDeperacated]
 }
